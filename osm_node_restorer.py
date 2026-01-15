@@ -274,8 +274,9 @@ class OSMAPIClient:
         """
         Fetch the complete history of a node, optionally filtered by date range.
         
-        When date range is specified, uses changeset API to find relevant changesets first,
-        then fetches only those specific node versions to minimize data transfer.
+        Note: The OSM API does not support server-side date filtering for node history.
+        When date parameters are provided, this method fetches the full history and
+        filters it client-side to minimize data transfer in the application layer.
         
         Args:
             node_id: ID of the node to fetch
@@ -285,57 +286,48 @@ class OSMAPIClient:
         Returns:
             list: List of node versions with metadata, or None on error
         """
-        # If no date filter, fetch all history (original behavior)
-        if not start_date and not end_date:
-            url = f"{OSM_API_URL}/node/{node_id}/history.json"
+        url = f"{OSM_API_URL}/node/{node_id}/history.json"
+        
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            full_history = data.get('elements', [])
             
-            try:
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                return data.get('elements', [])
-            except requests.RequestException as e:
-                print(f"Error fetching node history: {e}")
-                return None
-        
-        # Date-filtered approach: Query changesets first, then fetch specific versions
-        print(f"Fetching changesets for node {node_id} from {start_date} to {end_date}...")
-        
-        # Step 1: Get full history to find all changesets
-        full_history = self.get_node_history(node_id)
-        if not full_history:
-            return None
-        
-        # Step 2: Filter by date on client side (API doesn't support server-side date filtering for node history)
-        from datetime import datetime
-        filtered_versions = []
-        
-        for version in full_history:
-            timestamp_str = version.get('timestamp', '')
-            if timestamp_str:
-                try:
-                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    
-                    # Check date range
-                    in_range = True
-                    if start_date:
-                        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                        if timestamp < start_dt:
-                            in_range = False
-                    
-                    if end_date and in_range:
-                        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                        if timestamp > end_dt:
-                            in_range = False
-                    
-                    if in_range:
+            # If no date filter requested, return all history
+            if not start_date and not end_date:
+                return full_history
+            
+            # Apply client-side date filtering
+            from datetime import datetime
+            filtered_versions = []
+            
+            # Parse date boundaries once
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00')) if start_date else None
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00')) if end_date else None
+            
+            for version in full_history:
+                timestamp_str = version.get('timestamp', '')
+                if timestamp_str:
+                    try:
+                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        
+                        # Check if within date range
+                        if start_dt and timestamp < start_dt:
+                            continue
+                        if end_dt and timestamp > end_dt:
+                            continue
+                        
                         filtered_versions.append(version)
                         
-                except (ValueError, AttributeError):
-                    continue
-        
-        print(f"Filtered to {len(filtered_versions)} versions from {len(full_history)} total")
-        return filtered_versions
+                    except (ValueError, AttributeError):
+                        continue
+            
+            return filtered_versions
+            
+        except requests.RequestException as e:
+            print(f"Error fetching node history: {e}")
+            return None
     
     def get_node_version(self, node_id: int, version: int) -> Optional[Dict[str, Any]]:
         """
@@ -1152,9 +1144,9 @@ class OSMNodeRestorerApp(QMainWindow):
         # Server-side filter option (fetch less data from API)
         self.server_filter_enabled = QCheckBox("Apply filter when fetching (reduces API load)")
         self.server_filter_enabled.setToolTip(
-            "When enabled, filters date range BEFORE fetching from API.\n"
-            "This reduces data transfer but requires re-fetching if you change the date range.\n"
-            "When disabled, fetches all history once and filters locally (faster for multiple filter changes)."
+            "When enabled, the full node history is fetched but filtered before storing in cache.\n"
+            "This reduces memory usage and initial processing time.\n"
+            "Note: The OSM API does not support server-side date filtering for node history."
         )
         filter_layout.addWidget(self.server_filter_enabled)
         
@@ -1578,7 +1570,7 @@ class OSMNodeRestorerApp(QMainWindow):
             self.filter_info_label.setText("")
             return
         
-        # Get date range
+        # Get date range and parse once
         from datetime import datetime
         start_date = self.start_date_edit.date().toPyDate()
         end_date = self.end_date_edit.date().toPyDate()
@@ -2075,21 +2067,29 @@ class OSMNodeRestorerApp(QMainWindow):
         end_date = None
         use_cache = False
         
-        if self.my_nodes_filter_enabled.isChecked() and self.my_nodes_server_filter.isChecked():
+        # Always extract dates from widgets if filter is enabled (for both server and client filtering)
+        if self.my_nodes_filter_enabled.isChecked():
             start_date = self.my_nodes_start_date.date().toString("yyyy-MM-dd") + "T00:00:00Z"
             end_date = self.my_nodes_end_date.date().toString("yyyy-MM-dd") + "T23:59:59Z"
             
             # Check if we can use cache
-            if self.my_nodes_cache_complete:
-                use_cache = True
-                self.statusBar().showMessage("Using cached data (filtering locally)...")
-            elif self.my_nodes_cache_date_range:
-                cached_start, cached_end = self.my_nodes_cache_date_range
-                if start_date >= cached_start and end_date <= cached_end:
+            if self.my_nodes_server_filter.isChecked():
+                # Server-side filtering requested
+                if self.my_nodes_cache_complete:
                     use_cache = True
-                    self.statusBar().showMessage("Using cached data (range already fetched)...")
+                    self.statusBar().showMessage("Using cached data (filtering locally)...")
+                elif self.my_nodes_cache_date_range:
+                    cached_start, cached_end = self.my_nodes_cache_date_range
+                    if start_date >= cached_start and end_date <= cached_end:
+                        use_cache = True
+                        self.statusBar().showMessage("Using cached data (range already fetched)...")
+            else:
+                # Client-side filtering only
+                if self.my_nodes_cache_complete or self.my_nodes_cache:
+                    use_cache = True
+                    self.statusBar().showMessage("Using cached data (filtering locally)...")
         else:
-            # No filter or client-side only
+            # No filter
             if self.my_nodes_cache_complete:
                 use_cache = True
                 self.statusBar().showMessage("Using cached data...")
@@ -2098,6 +2098,16 @@ class OSMNodeRestorerApp(QMainWindow):
             # Apply filters to cached data
             self.apply_my_nodes_cache_filter(start_date, end_date)
             return
+        
+        # Clear cache at start of new scan to prevent duplicates
+        self.my_nodes_cache.clear()
+        
+        # Determine if we need server-side filtering (date range for API call)
+        api_start_date = None
+        api_end_date = None
+        if self.my_nodes_filter_enabled.isChecked() and self.my_nodes_server_filter.isChecked():
+            api_start_date = start_date
+            api_end_date = end_date
         
         # Confirm the operation
         filter_msg = f"\n\nFiltering: {start_date[:10]} to {end_date[:10]}" if start_date and end_date else ""
@@ -2119,11 +2129,11 @@ class OSMNodeRestorerApp(QMainWindow):
         self.my_nodes_table.setRowCount(0)
         self.my_nodes_summary.setText("Starting scan...")
         
-        # Start worker
-        self.my_nodes_worker = UserNodesWorker(self.api_client, start_date, end_date)
+        # Start worker with API date filtering if server-side filter is enabled
+        self.my_nodes_worker = UserNodesWorker(self.api_client, api_start_date, api_end_date)
         self.my_nodes_worker.progress.connect(self.on_my_nodes_progress)
         self.my_nodes_worker.node_found.connect(self.on_my_node_checked)
-        self.my_nodes_worker.finished.connect(lambda stats: self.on_my_nodes_finished(stats, start_date, end_date))
+        self.my_nodes_worker.finished.connect(lambda stats: self.on_my_nodes_finished(stats, api_start_date, api_end_date))
         self.my_nodes_worker.error.connect(self.on_my_nodes_error)
         self.my_nodes_worker.start()
     
@@ -2263,12 +2273,16 @@ class OSMNodeRestorerApp(QMainWindow):
         
         from datetime import datetime
         
-        # Filter cached nodes by date if filter is enabled
-        filtered_nodes = []
+        # Parse date boundaries once if filtering is needed
+        start_dt = None
+        end_dt = None
         if start_date and end_date and self.my_nodes_filter_enabled.isChecked():
             start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
             end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            
+        
+        # Filter cached nodes by date if filter is enabled
+        filtered_nodes = []
+        if start_dt and end_dt:
             for node_data in self.my_nodes_cache:
                 status_info = node_data['status_info']
                 last_modified = status_info.get('last_modified', '')
