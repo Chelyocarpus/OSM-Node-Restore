@@ -7,11 +7,18 @@ A PyQt6 desktop application for restoring deleted OpenStreetMap nodes with compl
 - **OAuth 2.0 Authentication**: Secure authentication with OpenStreetMap API
 - **Node History Retrieval**: Fetch complete version history of any node
 - **Visual History Display**: Table view showing all versions with timestamps, users, and visibility status
+- **Flexible Date Range Filtering**: 
+  - Client-side filtering for instant results when exploring date ranges
+  - Server-side filtering to minimize API data transfer for nodes with extensive history
+  - Interactive date pickers with calendar popups
 - **Tag Inspection**: View tags for any historical version
 - **Node Status Checking**: Bulk check if multiple nodes are deleted/disabled
 - **My Nodes Monitoring**: Check all nodes you've created to detect unauthorized deletions
 - **Node Restoration**: Restore deleted nodes to a previous version
 - **Changeset Management**: Automatic changeset creation and closure
+- **Performance Optimization**: 
+  - Full history caching to minimize API calls and enable instant filtering
+  - Optional server-side date filtering to reduce bandwidth usage
 - **User-Friendly Interface**: Clean, tabbed interface with progress indicators and clickable links
 
 ## Prerequisites
@@ -81,6 +88,26 @@ python osm_node_restorer.py
    - **Visible**: Whether the node is visible (false = deleted)
    - **Lat/Lon**: Geographic coordinates
 
+**Optional: Filter by Date Range**
+1. Check **"Enable Date Range Filter"** to show only versions within a specific date range
+2. Select the **From** date (start of range)
+3. Select the **To** date (end of range)
+4. **Choose your filtering strategy**:
+   - **Client-side filtering (default)**: Fetches all history once, then filters locally
+     - ✅ Instant filter updates when changing date ranges
+     - ✅ No additional API calls when adjusting filters
+     - ⚠️ Must download full history initially
+   - **Server-side filtering**: Check "Apply filter when fetching" to filter BEFORE downloading
+     - ✅ Minimal data transfer from API (only downloads versions in date range)
+     - ✅ Essential for nodes with millions of versions
+     - ✅ Smart caching avoids re-fetching when narrowing range or repeating queries
+     - ℹ️ Only fetches new data when expanding beyond previously cached range
+5. The table will automatically update to show only versions within the date range
+6. A summary label will show how many versions are displayed (e.g., "Showing 5 of 20 versions")
+7. Click **"Clear Filter"** to remove the filter and show all versions again
+
+**💡 Tip**: For nodes with extensive history (100+ versions), enable server-side filtering to reduce bandwidth usage.
+
 #### 3. Checking Node Status (Bulk Check)
 
 1. Switch to the **Check Status** tab
@@ -97,7 +124,12 @@ python osm_node_restorer.py
 #### 4. Monitoring Your Created Nodes
 
 1. Switch to the **My Nodes** tab
-2. Click **"Check All My Nodes"** (requires authentication)
+2. **Optional: Enable Date Range Filter** (similar to Restore Node tab)
+   - Check "Enable Date Range Filter" to scan only nodes created within a specific timeframe
+   - Select date range (From/To dates)
+   - Check "Apply filter when fetching" to reduce API load (recommended for prolific mappers)
+   - Smart caching avoids re-fetching when adjusting dates
+3. Click **"Check All My Nodes"** (requires authentication)
 3. Confirm the operation (this may take several minutes)
 4. The application will:
    - Fetch your user profile and changesets
