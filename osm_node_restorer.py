@@ -28,9 +28,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox,
     QTableWidget, QTableWidgetItem, QTabWidget, QGroupBox,
-    QProgressBar
+    QProgressBar, QDateEdit, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QDate
 from PyQt6.QtGui import QFont, QIcon, QDesktopServices, QColor
 from PyQt6.QtWidgets import QStyle
 
@@ -270,26 +270,72 @@ class OSMAPIClient:
         """
         self.oauth = oauth_handler
         
-    def get_node_history(self, node_id: int) -> Optional[List[Dict[str, Any]]]:
+    def get_node_history(self, node_id: int, start_date: str = None, end_date: str = None) -> Optional[List[Dict[str, Any]]]:
         """
-        Fetch the complete history of a node.
+        Fetch the complete history of a node, optionally filtered by date range.
+        
+        When date range is specified, uses changeset API to find relevant changesets first,
+        then fetches only those specific node versions to minimize data transfer.
         
         Args:
             node_id: ID of the node to fetch
+            start_date: ISO 8601 date string (e.g., "2024-01-01T00:00:00Z") - optional
+            end_date: ISO 8601 date string - optional
             
         Returns:
             list: List of node versions with metadata, or None on error
         """
-        url = f"{OSM_API_URL}/node/{node_id}/history.json"
+        # If no date filter, fetch all history (original behavior)
+        if not start_date and not end_date:
+            url = f"{OSM_API_URL}/node/{node_id}/history.json"
+            
+            try:
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                return data.get('elements', [])
+            except requests.RequestException as e:
+                print(f"Error fetching node history: {e}")
+                return None
         
-        try:
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            return data.get('elements', [])
-        except requests.RequestException as e:
-            print(f"Error fetching node history: {e}")
+        # Date-filtered approach: Query changesets first, then fetch specific versions
+        print(f"Fetching changesets for node {node_id} from {start_date} to {end_date}...")
+        
+        # Step 1: Get full history to find all changesets
+        full_history = self.get_node_history(node_id)
+        if not full_history:
             return None
+        
+        # Step 2: Filter by date on client side (API doesn't support server-side date filtering for node history)
+        from datetime import datetime
+        filtered_versions = []
+        
+        for version in full_history:
+            timestamp_str = version.get('timestamp', '')
+            if timestamp_str:
+                try:
+                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    
+                    # Check date range
+                    in_range = True
+                    if start_date:
+                        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                        if timestamp < start_dt:
+                            in_range = False
+                    
+                    if end_date and in_range:
+                        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                        if timestamp > end_dt:
+                            in_range = False
+                    
+                    if in_range:
+                        filtered_versions.append(version)
+                        
+                except (ValueError, AttributeError):
+                    continue
+        
+        print(f"Filtered to {len(filtered_versions)} versions from {len(full_history)} total")
+        return filtered_versions
     
     def get_node_version(self, node_id: int, version: int) -> Optional[Dict[str, Any]]:
         """
@@ -542,13 +588,15 @@ class OSMAPIClient:
             print(f"Error fetching user details: {e}")
             return None
     
-    def get_user_changesets(self, username: str, limit: int = 100) -> Optional[List[Dict[str, Any]]]:
+    def get_user_changesets(self, username: str, limit: int = 100, start_date: str = None, end_date: str = None) -> Optional[List[Dict[str, Any]]]:
         """
-        Get changesets created by a specific user.
+        Get changesets created by a specific user, optionally filtered by date range.
         
         Args:
             username: OSM username (display name)
             limit: Maximum number of changesets to fetch
+            start_date: ISO 8601 date string for filtering (optional)
+            end_date: ISO 8601 date string for filtering (optional)
             
         Returns:
             list: List of changeset information
@@ -556,6 +604,11 @@ class OSMAPIClient:
         # Limit to 100 maximum as per API capabilities
         actual_limit = min(limit, 100)
         url = f"{OSM_API_URL}/changesets?display_name={username}&limit={actual_limit}"
+        
+        # Add date filtering if specified
+        if start_date and end_date:
+            # Use 'time' parameter for date range filtering
+            url += f"&time={start_date},{end_date}"
         
         try:
             response = requests.get(url, timeout=30)
@@ -692,21 +745,25 @@ class NodeHistoryWorker(QThread):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
     
-    def __init__(self, api_client: OSMAPIClient, node_id: int):
+    def __init__(self, api_client: OSMAPIClient, node_id: int, start_date: str = None, end_date: str = None):
         """
         Initialize the worker thread.
         
         Args:
             api_client: OSM API client
             node_id: Node ID to fetch history for
+            start_date: Optional ISO 8601 start date for filtering
+            end_date: Optional ISO 8601 end date for filtering
         """
         super().__init__()
         self.api_client = api_client
         self.node_id = node_id
+        self.start_date = start_date
+        self.end_date = end_date
     
     def run(self):
         """Execute the background task."""
-        history = self.api_client.get_node_history(self.node_id)
+        history = self.api_client.get_node_history(self.node_id, self.start_date, self.end_date)
         if history is not None:
             self.finished.emit(history)
         else:
@@ -763,15 +820,19 @@ class UserNodesWorker(QThread):
     finished = pyqtSignal(dict)           # summary stats
     error = pyqtSignal(str)
     
-    def __init__(self, api_client: OSMAPIClient):
+    def __init__(self, api_client: OSMAPIClient, start_date: str = None, end_date: str = None):
         """
         Initialize the worker thread.
         
         Args:
             api_client: OSM API client
+            start_date: Optional ISO 8601 start date for filtering
+            end_date: Optional ISO 8601 end date for filtering
         """
         super().__init__()
         self.api_client = api_client
+        self.start_date = start_date
+        self.end_date = end_date
     
     def run(self):
         """Execute the background task."""
@@ -786,9 +847,14 @@ class UserNodesWorker(QThread):
             user_id = user_info.get('id')
             display_name = user_info.get('display_name')
             
-            # Get user's changesets
+            # Get user's changesets with optional date filtering
             self.progress.emit(0, 0, f"Fetching changesets for {display_name}...")
-            changesets = self.api_client.get_user_changesets(display_name, limit=200)
+            changesets = self.api_client.get_user_changesets(
+                display_name, 
+                limit=200,
+                start_date=self.start_date,
+                end_date=self.end_date
+            )
             if not changesets:
                 self.error.emit("Failed to get user changesets or no changesets found.")
                 return
@@ -865,7 +931,16 @@ class OSMNodeRestorerApp(QMainWindow):
         super().__init__()
         self.oauth_handler = OAuthHandler()
         self.api_client = OSMAPIClient(self.oauth_handler)
-        self.current_node_history: List[Dict[str, Any]] = []
+        self.current_node_history: List[Dict[str, Any]] = []  # Full cached history
+        self.filtered_node_history: List[Dict[str, Any]] = []  # Filtered history for display
+        self.cached_node_id: Optional[int] = None  # Track which node is cached
+        self.cached_date_range: Optional[tuple] = None  # (start_date, end_date) of cached data
+        self.cache_is_complete: bool = False  # True if we have ALL history (no date filter used)
+        
+        # My Nodes cache
+        self.my_nodes_cache: List[Dict[str, Any]] = []  # Cached user nodes
+        self.my_nodes_cache_date_range: Optional[tuple] = None  # Date range of cached data
+        self.my_nodes_cache_complete: bool = False  # True if we have all user's nodes
         
         # Load saved credentials if available
         self.oauth_handler.load_credentials()
@@ -1065,6 +1140,68 @@ class OSMNodeRestorerApp(QMainWindow):
         search_group.setLayout(search_layout)
         layout.addWidget(search_group)
         
+        # Date filter group
+        filter_group = QGroupBox("Date Range Filter")
+        filter_layout = QVBoxLayout()
+        
+        # Enable filter checkbox
+        self.filter_enabled = QCheckBox("Enable Date Range Filter")
+        self.filter_enabled.stateChanged.connect(self.apply_date_filter)
+        filter_layout.addWidget(self.filter_enabled)
+        
+        # Server-side filter option (fetch less data from API)
+        self.server_filter_enabled = QCheckBox("Apply filter when fetching (reduces API load)")
+        self.server_filter_enabled.setToolTip(
+            "When enabled, filters date range BEFORE fetching from API.\n"
+            "This reduces data transfer but requires re-fetching if you change the date range.\n"
+            "When disabled, fetches all history once and filters locally (faster for multiple filter changes)."
+        )
+        filter_layout.addWidget(self.server_filter_enabled)
+        
+        # Date range inputs
+        date_range_layout = QHBoxLayout()
+        
+        # Start date
+        date_range_layout.addWidget(QLabel("From:"))
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDate(QDate.currentDate().addYears(-1))  # Default to 1 year ago
+        self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.start_date_edit.setEnabled(False)
+        self.start_date_edit.dateChanged.connect(self.apply_date_filter)
+        date_range_layout.addWidget(self.start_date_edit)
+        
+        # End date
+        date_range_layout.addWidget(QLabel("To:"))
+        self.end_date_edit = QDateEdit()
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDate(QDate.currentDate())
+        self.end_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.end_date_edit.setEnabled(False)
+        self.end_date_edit.dateChanged.connect(self.apply_date_filter)
+        date_range_layout.addWidget(self.end_date_edit)
+        
+        # Clear filter button
+        self.clear_filter_button = QPushButton("Clear Filter")
+        self.clear_filter_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
+        self.clear_filter_button.setEnabled(False)
+        self.clear_filter_button.clicked.connect(self.clear_date_filter)
+        date_range_layout.addWidget(self.clear_filter_button)
+        
+        date_range_layout.addStretch()
+        filter_layout.addLayout(date_range_layout)
+        
+        # Filter info label
+        self.filter_info_label = QLabel("")
+        self.filter_info_label.setStyleSheet("color: gray; font-size: 9pt;")
+        filter_layout.addWidget(self.filter_info_label)
+        
+        filter_group.setLayout(filter_layout)
+        layout.addWidget(filter_group)
+        
+        # Connect checkbox to enable/disable date pickers
+        self.filter_enabled.stateChanged.connect(self.toggle_date_filter_controls)
+        
         # History table
         history_group = QGroupBox("Node History")
         history_layout = QVBoxLayout()
@@ -1203,6 +1340,69 @@ class OSMNodeRestorerApp(QMainWindow):
         button_layout.addWidget(self.check_my_nodes_button)
         button_layout.addStretch()
         info_layout.addLayout(button_layout)
+        
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+        
+        # Date filter group (same as restore tab)
+        my_nodes_filter_group = QGroupBox("Date Range Filter")
+        my_nodes_filter_layout = QVBoxLayout()
+        
+        # Enable filter checkbox
+        self.my_nodes_filter_enabled = QCheckBox("Enable Date Range Filter")
+        self.my_nodes_filter_enabled.stateChanged.connect(self.on_my_nodes_filter_changed)
+        my_nodes_filter_layout.addWidget(self.my_nodes_filter_enabled)
+        
+        # Server-side filter option
+        self.my_nodes_server_filter = QCheckBox("Apply filter when fetching (reduces API load)")
+        self.my_nodes_server_filter.setToolTip(
+            "When enabled, only fetches changesets created within the date range.\n"
+            "This significantly reduces API requests for users with many changesets.\n"
+            "Smart caching avoids re-fetching when you adjust the date range."
+        )
+        my_nodes_filter_layout.addWidget(self.my_nodes_server_filter)
+        
+        # Date range inputs
+        my_nodes_date_layout = QHBoxLayout()
+        
+        # Start date
+        my_nodes_date_layout.addWidget(QLabel("From:"))
+        self.my_nodes_start_date = QDateEdit()
+        self.my_nodes_start_date.setCalendarPopup(True)
+        self.my_nodes_start_date.setDate(QDate.currentDate().addYears(-1))
+        self.my_nodes_start_date.setDisplayFormat("yyyy-MM-dd")
+        self.my_nodes_start_date.setEnabled(False)
+        my_nodes_date_layout.addWidget(self.my_nodes_start_date)
+        
+        # End date
+        my_nodes_date_layout.addWidget(QLabel("To:"))
+        self.my_nodes_end_date = QDateEdit()
+        self.my_nodes_end_date.setCalendarPopup(True)
+        self.my_nodes_end_date.setDate(QDate.currentDate())
+        self.my_nodes_end_date.setDisplayFormat("yyyy-MM-dd")
+        self.my_nodes_end_date.setEnabled(False)
+        my_nodes_date_layout.addWidget(self.my_nodes_end_date)
+        
+        # Clear filter button
+        self.my_nodes_clear_filter = QPushButton("Clear Filter")
+        self.my_nodes_clear_filter.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
+        self.my_nodes_clear_filter.setEnabled(False)
+        self.my_nodes_clear_filter.clicked.connect(self.clear_my_nodes_filter)
+        my_nodes_date_layout.addWidget(self.my_nodes_clear_filter)
+        
+        my_nodes_date_layout.addStretch()
+        my_nodes_filter_layout.addLayout(my_nodes_date_layout)
+        
+        # Filter info label
+        self.my_nodes_filter_info = QLabel("")
+        self.my_nodes_filter_info.setStyleSheet("color: gray; font-size: 9pt;")
+        my_nodes_filter_layout.addWidget(self.my_nodes_filter_info)
+        
+        my_nodes_filter_group.setLayout(my_nodes_filter_layout)
+        layout.addWidget(my_nodes_filter_group)
+        
+        # Connect checkbox to enable/disable controls
+        self.my_nodes_filter_enabled.stateChanged.connect(self.toggle_my_nodes_filter_controls)
         
         # Progress info
         self.my_nodes_progress_label = QLabel("")
@@ -1354,9 +1554,107 @@ class OSMNodeRestorerApp(QMainWindow):
                 f"Failed to clear credentials: {e}"
             )
     
+    def toggle_date_filter_controls(self):
+        """Enable/disable date filter controls based on checkbox state."""
+        enabled = self.filter_enabled.isChecked()
+        self.start_date_edit.setEnabled(enabled)
+        self.end_date_edit.setEnabled(enabled)
+        self.clear_filter_button.setEnabled(enabled)
+    
+    def apply_date_filter(self):
+        """
+        Apply date range filter to cached history and update table display.
+        Uses cached full history and filters it client-side for performance.
+        """
+        if not self.current_node_history:
+            self.filtered_node_history = []
+            self.update_history_table()
+            return
+        
+        # If filter is not enabled, show all history
+        if not self.filter_enabled.isChecked():
+            self.filtered_node_history = self.current_node_history
+            self.update_history_table()
+            self.filter_info_label.setText("")
+            return
+        
+        # Get date range
+        from datetime import datetime
+        start_date = self.start_date_edit.date().toPyDate()
+        end_date = self.end_date_edit.date().toPyDate()
+        
+        # Ensure end date is after start date
+        if end_date < start_date:
+            self.filter_info_label.setText("⚠️ End date must be after start date")
+            self.filter_info_label.setStyleSheet("color: red; font-size: 9pt;")
+            return
+        
+        # Filter history by date range
+        filtered = []
+        for version in self.current_node_history:
+            timestamp_str = version.get('timestamp', '')
+            if timestamp_str:
+                try:
+                    # Parse ISO 8601 timestamp
+                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    version_date = timestamp.date()
+                    
+                    # Check if within range
+                    if start_date <= version_date <= end_date:
+                        filtered.append(version)
+                except (ValueError, AttributeError):
+                    # If timestamp parsing fails, skip this version
+                    continue
+        
+        self.filtered_node_history = filtered
+        self.update_history_table()
+        
+        # Update info label
+        total_count = len(self.current_node_history)
+        filtered_count = len(filtered)
+        self.filter_info_label.setText(
+            f"Showing {filtered_count} of {total_count} versions "
+            f"(from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})"
+        )
+        self.filter_info_label.setStyleSheet("color: gray; font-size: 9pt;")
+    
+    def clear_date_filter(self):
+        """Clear the date filter and show all history."""
+        self.filter_enabled.setChecked(False)
+        self.server_filter_enabled.setChecked(False)
+        self.start_date_edit.setDate(QDate.currentDate().addYears(-1))
+        self.end_date_edit.setDate(QDate.currentDate())
+        self.apply_date_filter()
+    
+    def update_history_table(self):
+        """
+        Update the history table with filtered data.
+        Uses filtered_node_history which may be the full or filtered dataset.
+        """
+        history = self.filtered_node_history
+        self.history_table.setRowCount(len(history))
+        
+        for i, version in enumerate(history):
+            self.history_table.setItem(i, 0, QTableWidgetItem(str(version.get('version', ''))))
+            self.history_table.setItem(i, 1, QTableWidgetItem(version.get('timestamp', '')))
+            self.history_table.setItem(i, 2, QTableWidgetItem(version.get('user', '')))
+            self.history_table.setItem(i, 3, QTableWidgetItem(str(version.get('visible', ''))))
+            self.history_table.setItem(i, 4, QTableWidgetItem(str(version.get('lat', ''))))
+            self.history_table.setItem(i, 5, QTableWidgetItem(str(version.get('lon', ''))))
+        
+        # Update status bar with cache info
+        if self.filter_enabled.isChecked() and len(history) < len(self.current_node_history):
+            cache_info = " [cached]" if self.cached_node_id else ""
+            self.statusBar().showMessage(
+                f"Showing {len(history)} of {len(self.current_node_history)} versions (filtered){cache_info}"
+            )
+        else:
+            cache_info = " [complete cache]" if self.cache_is_complete else " [partial cache]" if self.cached_date_range else ""
+            self.statusBar().showMessage(f"Found {len(history)} versions{cache_info}")
+    
     @pyqtSlot()
     def fetch_node_history(self):
-        """Fetch the history of the specified node."""
+        """Fetch the history of the specified node with intelligent caching."""
         if not self.oauth_handler.access_token:
             QMessageBox.warning(
                 self, "Not Authenticated",
@@ -1381,46 +1679,133 @@ class OSMNodeRestorerApp(QMainWindow):
             )
             return
         
+        # Check if we can use cached data
+        start_date = None
+        end_date = None
+        use_cache = False
+        
+        if self.filter_enabled.isChecked() and self.server_filter_enabled.isChecked():
+            # Server-side filtering requested
+            start_date = self.start_date_edit.date().toString("yyyy-MM-dd") + "T00:00:00Z"
+            end_date = self.end_date_edit.date().toString("yyyy-MM-dd") + "T23:59:59Z"
+            
+            # Check cache validity
+            if node_id == self.cached_node_id:
+                if self.cache_is_complete:
+                    # We have complete history, just filter it
+                    use_cache = True
+                    self.statusBar().showMessage(f"Using cached data (filtering locally)...")
+                elif self.cached_date_range:
+                    cached_start, cached_end = self.cached_date_range
+                    # Check if requested range is within cached range
+                    if start_date >= cached_start and end_date <= cached_end:
+                        use_cache = True
+                        self.statusBar().showMessage(f"Using cached data (range already fetched)...")
+        else:
+            # No server-side filter or filter disabled - fetch all
+            if node_id == self.cached_node_id and self.cache_is_complete:
+                # Already have complete history
+                use_cache = True
+                self.statusBar().showMessage(f"Using cached data...")
+        
+        if use_cache:
+            # Use cached data - just reapply filters
+            self.apply_date_filter()
+            return
+        
+        # Need to fetch from server
+        if start_date and end_date:
+            self.statusBar().showMessage(
+                f"Fetching history for node {node_id} (filtered: {start_date[:10]} to {end_date[:10]})..."
+            )
+        else:
+            self.statusBar().showMessage(f"Fetching history for node {node_id}...")
+        
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate progress
         self.search_button.setEnabled(False)
-        self.statusBar().showMessage(f"Fetching history for node {node_id}...")
         
         # Create and start worker thread
-        self.worker = NodeHistoryWorker(self.api_client, node_id)
-        self.worker.finished.connect(self.on_history_fetched)
+        self.worker = NodeHistoryWorker(self.api_client, node_id, start_date, end_date)
+        self.worker.finished.connect(lambda history: self.on_history_fetched(history, node_id, start_date, end_date))
         self.worker.error.connect(self.on_history_error)
         self.worker.start()
     
     @pyqtSlot(list)
-    def on_history_fetched(self, history: List[Dict[str, Any]]):
+    def on_history_fetched(self, history: List[Dict[str, Any]], node_id: int, start_date: str = None, end_date: str = None):
         """
-        Handle successful history fetch.
+        Handle successful history fetch with cache management.
         
         Args:
             history: List of node versions
+            node_id: ID of the node that was fetched
+            start_date: Start date used for filtering (None if no filter)
+            end_date: End date used for filtering (None if no filter)
         """
         self.progress_bar.setVisible(False)
         self.search_button.setEnabled(True)
-        self.current_node_history = history
         
-        # Populate table
-        self.history_table.setRowCount(len(history))
-        for i, version in enumerate(history):
-            self.history_table.setItem(i, 0, QTableWidgetItem(str(version.get('version', ''))))
-            self.history_table.setItem(i, 1, QTableWidgetItem(version.get('timestamp', '')))
-            self.history_table.setItem(i, 2, QTableWidgetItem(version.get('user', '')))
-            self.history_table.setItem(i, 3, QTableWidgetItem(str(version.get('visible', ''))))
-            self.history_table.setItem(i, 4, QTableWidgetItem(str(version.get('lat', ''))))
-            self.history_table.setItem(i, 5, QTableWidgetItem(str(version.get('lon', ''))))
+        # Update cache metadata
+        if node_id != self.cached_node_id:
+            # New node - replace cache
+            self.cached_node_id = node_id
+            self.current_node_history = history
+            self.cache_is_complete = (start_date is None and end_date is None)
+            self.cached_date_range = (start_date, end_date) if start_date and end_date else None
+        else:
+            # Same node - merge with existing cache
+            if start_date is None and end_date is None:
+                # Fetched complete history
+                self.current_node_history = history
+                self.cache_is_complete = True
+                self.cached_date_range = None
+            else:
+                # Fetched partial history - merge intelligently
+                self._merge_history_cache(history, start_date, end_date)
         
-        self.statusBar().showMessage(f"Found {len(history)} versions")
+        # Apply date filter if enabled, otherwise show all
+        self.apply_date_filter()
         
         if not history:
             QMessageBox.information(
                 self, "No History",
                 "No history found for this node. It may not exist."
             )
+    
+    def _merge_history_cache(self, new_history: List[Dict[str, Any]], start_date: str, end_date: str):
+        """
+        Intelligently merge new history data with existing cache.
+        
+        Args:
+            new_history: Newly fetched history data
+            start_date: Start date of new data
+            end_date: End date of new data
+        """
+        if not self.current_node_history:
+            # No existing cache
+            self.current_node_history = new_history
+            self.cached_date_range = (start_date, end_date)
+            return
+        
+        # Merge by version number (unique identifier)
+        existing_versions = {v.get('version'): v for v in self.current_node_history}
+        
+        for version in new_history:
+            version_num = version.get('version')
+            if version_num and version_num not in existing_versions:
+                existing_versions[version_num] = version
+        
+        # Convert back to sorted list
+        self.current_node_history = sorted(existing_versions.values(), key=lambda v: v.get('version', 0))
+        
+        # Update cached range to cover both old and new ranges
+        if self.cached_date_range:
+            old_start, old_end = self.cached_date_range
+            new_start = min(old_start, start_date) if old_start else start_date
+            new_end = max(old_end, end_date) if old_end else end_date
+            self.cached_date_range = (new_start, new_end)
+        else:
+            self.cached_date_range = (start_date, end_date)
     
     @pyqtSlot(str)
     def on_history_error(self, error_msg: str):
@@ -1445,8 +1830,8 @@ class OSMNodeRestorerApp(QMainWindow):
             return
         
         row = self.history_table.currentRow()
-        if 0 <= row < len(self.current_node_history):
-            version_data = self.current_node_history[row]
+        if 0 <= row < len(self.filtered_node_history):
+            version_data = self.filtered_node_history[row]
             tags = version_data.get('tags', {})
             
             # Display tags
@@ -1468,10 +1853,10 @@ class OSMNodeRestorerApp(QMainWindow):
     def restore_node(self):
         """Restore the selected node version."""
         row = self.history_table.currentRow()
-        if row < 0 or row >= len(self.current_node_history):
+        if row < 0 or row >= len(self.filtered_node_history):
             return
         
-        version_data = self.current_node_history[row]
+        version_data = self.filtered_node_history[row]
         node_id = version_data.get('id')
         version = version_data.get('version')
         
@@ -1677,7 +2062,7 @@ class OSMNodeRestorerApp(QMainWindow):
     
     @pyqtSlot()
     def check_my_nodes(self):
-        """Check all nodes created by the authenticated user."""
+        """Check all nodes created by the authenticated user with intelligent caching."""
         if not self.oauth_handler.access_token:
             QMessageBox.warning(
                 self, "Not Authenticated",
@@ -1685,10 +2070,40 @@ class OSMNodeRestorerApp(QMainWindow):
             )
             return
         
+        # Determine date range
+        start_date = None
+        end_date = None
+        use_cache = False
+        
+        if self.my_nodes_filter_enabled.isChecked() and self.my_nodes_server_filter.isChecked():
+            start_date = self.my_nodes_start_date.date().toString("yyyy-MM-dd") + "T00:00:00Z"
+            end_date = self.my_nodes_end_date.date().toString("yyyy-MM-dd") + "T23:59:59Z"
+            
+            # Check if we can use cache
+            if self.my_nodes_cache_complete:
+                use_cache = True
+                self.statusBar().showMessage("Using cached data (filtering locally)...")
+            elif self.my_nodes_cache_date_range:
+                cached_start, cached_end = self.my_nodes_cache_date_range
+                if start_date >= cached_start and end_date <= cached_end:
+                    use_cache = True
+                    self.statusBar().showMessage("Using cached data (range already fetched)...")
+        else:
+            # No filter or client-side only
+            if self.my_nodes_cache_complete:
+                use_cache = True
+                self.statusBar().showMessage("Using cached data...")
+        
+        if use_cache:
+            # Apply filters to cached data
+            self.apply_my_nodes_cache_filter(start_date, end_date)
+            return
+        
         # Confirm the operation
+        filter_msg = f"\n\nFiltering: {start_date[:10]} to {end_date[:10]}" if start_date and end_date else ""
         reply = QMessageBox.question(
             self, "Confirm Check",
-            "This will check all nodes you've ever created to see if any have been deleted.\n\n"
+            f"This will check all nodes you've created to see if any have been deleted.{filter_msg}\n\n"
             "This process may take several minutes and will make many API requests.\n\n"
             "Do you want to continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
@@ -1705,10 +2120,10 @@ class OSMNodeRestorerApp(QMainWindow):
         self.my_nodes_summary.setText("Starting scan...")
         
         # Start worker
-        self.my_nodes_worker = UserNodesWorker(self.api_client)
+        self.my_nodes_worker = UserNodesWorker(self.api_client, start_date, end_date)
         self.my_nodes_worker.progress.connect(self.on_my_nodes_progress)
         self.my_nodes_worker.node_found.connect(self.on_my_node_checked)
-        self.my_nodes_worker.finished.connect(self.on_my_nodes_finished)
+        self.my_nodes_worker.finished.connect(lambda stats: self.on_my_nodes_finished(stats, start_date, end_date))
         self.my_nodes_worker.error.connect(self.on_my_nodes_error)
         self.my_nodes_worker.start()
     
@@ -1728,6 +2143,10 @@ class OSMNodeRestorerApp(QMainWindow):
     @pyqtSlot(int, dict)
     def on_my_node_checked(self, node_id: int, status_info: Dict[str, Any]):
         """Handle individual node check result."""
+        # Store all nodes in cache (not just deleted ones)
+        node_data = {'node_id': node_id, 'status_info': status_info}
+        self.my_nodes_cache.append(node_data)
+        
         # Only add deleted nodes to the table
         if status_info.get('visible') is False:
             row = self.my_nodes_table.rowCount()
@@ -1753,11 +2172,25 @@ class OSMNodeRestorerApp(QMainWindow):
             self.my_nodes_table.setItem(row, 6, QTableWidgetItem(status_info.get('last_modified', '')))
     
     @pyqtSlot(dict)
-    def on_my_nodes_finished(self, stats: Dict[str, Any]):
-        """Handle completion of my nodes check."""
+    def on_my_nodes_finished(self, stats: Dict[str, Any], start_date: str = None, end_date: str = None):
+        """Handle completion of my nodes check with cache management."""
         self.my_nodes_progress_bar.setVisible(False)
         self.my_nodes_progress_label.setText("")
         self.check_my_nodes_button.setEnabled(True)
+        
+        # Update cache metadata
+        if start_date is None and end_date is None:
+            self.my_nodes_cache_complete = True
+            self.my_nodes_cache_date_range = None
+        else:
+            # Merge date ranges if we already have some data
+            if self.my_nodes_cache_date_range:
+                old_start, old_end = self.my_nodes_cache_date_range
+                new_start = min(old_start, start_date) if old_start else start_date
+                new_end = max(old_end, end_date) if old_end else end_date
+                self.my_nodes_cache_date_range = (new_start, new_end)
+            else:
+                self.my_nodes_cache_date_range = (start_date, end_date)
         
         total = stats.get('total_nodes', 0)
         active = stats.get('active_nodes', 0)
@@ -1765,20 +2198,26 @@ class OSMNodeRestorerApp(QMainWindow):
         errors = stats.get('error_nodes', 0)
         user_name = stats.get('user_name', 'Unknown')
         
+        cache_info = " [complete cache]" if self.my_nodes_cache_complete else " [partial cache]"
+        
         if deleted == 0:
             self.my_nodes_summary.setText(
-                f"✅ Great news! All {active} of your nodes are still active."
+                f"✅ Great news! All {active} of your nodes are still active.{cache_info}"
             )
             self.my_nodes_summary.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
         else:
             self.my_nodes_summary.setText(
                 f"⚠️ Found {deleted} deleted nodes out of {total} total. "
-                f"{active} are still active, {errors} had errors."
+                f"{active} are still active, {errors} had errors.{cache_info}"
             )
             self.my_nodes_summary.setStyleSheet("color: orange; font-weight: bold; padding: 5px;")
         
+        filter_info = ""
+        if start_date and end_date:
+            filter_info = f" (filtered: {start_date[:10]} to {end_date[:10]})"
+        
         self.statusBar().showMessage(
-            f"Scan complete for {user_name}: {active} active, {deleted} deleted, {errors} errors"
+            f"Scan complete for {user_name}: {active} active, {deleted} deleted, {errors} errors{filter_info}"
         )
         
         if deleted > 0:
@@ -1788,6 +2227,125 @@ class OSMNodeRestorerApp(QMainWindow):
                 f"You can review them in the table below and use the 'Restore Node' tab "
                 f"to restore any that were inappropriately deleted."
             )
+    
+    def toggle_my_nodes_filter_controls(self):
+        """Enable/disable My Nodes date filter controls based on checkbox state."""
+        enabled = self.my_nodes_filter_enabled.isChecked()
+        self.my_nodes_start_date.setEnabled(enabled)
+        self.my_nodes_end_date.setEnabled(enabled)
+        self.my_nodes_server_filter.setEnabled(enabled)
+        self.my_nodes_clear_filter.setEnabled(enabled)
+    
+    def clear_my_nodes_filter(self):
+        """Clear the My Nodes date filter."""
+        self.my_nodes_filter_enabled.setChecked(False)
+        self.my_nodes_server_filter.setChecked(False)
+        self.my_nodes_start_date.setDate(QDate.currentDate().addYears(-1))
+        self.my_nodes_end_date.setDate(QDate.currentDate())
+        self.my_nodes_filter_info.setText("")
+    
+    def on_my_nodes_filter_changed(self):
+        """Handle My Nodes filter state change."""
+        if self.my_nodes_filter_enabled.isChecked():
+            start_date = self.my_nodes_start_date.date().toString("yyyy-MM-dd")
+            end_date = self.my_nodes_end_date.date().toString("yyyy-MM-dd")
+            self.my_nodes_filter_info.setText(
+                f"Filter enabled: {start_date} to {end_date}"
+            )
+        else:
+            self.my_nodes_filter_info.setText("")
+    
+    def apply_my_nodes_cache_filter(self, start_date: str = None, end_date: str = None):
+        """Apply client-side filtering to cached My Nodes data."""
+        if not self.my_nodes_cache:
+            self.check_my_nodes_button.setEnabled(True)
+            return
+        
+        from datetime import datetime
+        
+        # Filter cached nodes by date if filter is enabled
+        filtered_nodes = []
+        if start_date and end_date and self.my_nodes_filter_enabled.isChecked():
+            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+            
+            for node_data in self.my_nodes_cache:
+                status_info = node_data['status_info']
+                last_modified = status_info.get('last_modified', '')
+                
+                if last_modified:
+                    try:
+                        modified_dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
+                        if start_dt <= modified_dt <= end_dt:
+                            filtered_nodes.append(node_data)
+                    except (ValueError, AttributeError):
+                        continue
+        else:
+            # No filter - use all cached nodes
+            filtered_nodes = self.my_nodes_cache
+        
+        # Clear table and repopulate with filtered results
+        self.my_nodes_table.setRowCount(0)
+        
+        deleted_count = 0
+        active_count = 0
+        
+        for node_data in filtered_nodes:
+            node_id = node_data['node_id']
+            status_info = node_data['status_info']
+            
+            # Count all nodes
+            if status_info.get('visible') is False:
+                deleted_count += 1
+                
+                # Add deleted nodes to table
+                row = self.my_nodes_table.rowCount()
+                self.my_nodes_table.insertRow(row)
+                
+                # Node ID (clickable link)
+                node_link = f"<a href='{OSM_API_BASE}/node/{node_id}'>Node {node_id}</a>"
+                node_item = QLabel(node_link)
+                node_item.setOpenExternalLinks(True)
+                node_item.setTextFormat(Qt.TextFormat.RichText)
+                self.my_nodes_table.setCellWidget(row, 0, node_item)
+                
+                # Status
+                status_item = QTableWidgetItem("DELETED")
+                status_item.setForeground(QColor("red"))
+                self.my_nodes_table.setItem(row, 1, status_item)
+                
+                # Other info
+                self.my_nodes_table.setItem(row, 2, QTableWidgetItem(str(status_info.get('version', ''))))
+                self.my_nodes_table.setItem(row, 3, QTableWidgetItem(str(status_info.get('created_in_changeset', ''))))
+                self.my_nodes_table.setItem(row, 4, QTableWidgetItem(status_info.get('user', '')))
+                self.my_nodes_table.setItem(row, 5, QTableWidgetItem(str(status_info.get('changeset', ''))))
+                self.my_nodes_table.setItem(row, 6, QTableWidgetItem(status_info.get('last_modified', '')))
+            else:
+                active_count += 1
+        
+        # Update summary
+        total_count = len(filtered_nodes)
+        cache_info = " [cached]"
+        
+        if start_date and end_date:
+            filter_msg = f" (filtered: {start_date[:10]} to {end_date[:10]})"
+        else:
+            filter_msg = ""
+        
+        if deleted_count == 0:
+            self.my_nodes_summary.setText(
+                f"✅ Great news! All {active_count} of your nodes are still active.{cache_info}{filter_msg}"
+            )
+            self.my_nodes_summary.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+        else:
+            self.my_nodes_summary.setText(
+                f"⚠️ Found {deleted_count} deleted nodes out of {total_count} total. "
+                f"{active_count} are still active.{cache_info}{filter_msg}"
+            )
+            self.my_nodes_summary.setStyleSheet("color: orange; font-weight: bold; padding: 5px;")
+        
+        self.statusBar().showMessage(f"Showing cached results: {active_count} active, {deleted_count} deleted{filter_msg}")
+        self.check_my_nodes_button.setEnabled(True)
     
     @pyqtSlot(str)
     def on_my_nodes_error(self, error_msg: str):
